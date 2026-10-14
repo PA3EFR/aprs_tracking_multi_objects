@@ -1,0 +1,526 @@
+
+#!/usr/bin/env python3
+"""APRS Tracker - CORRECTE NOTATIE (multi-object, gelijktijdig)"""
+
+import aprslib
+import time
+import random
+import math
+import re
+import os
+import threading
+
+
+SPEED_RANGES = {
+    'auto': (50, 80),
+    'fiets': (10, 25),
+    'lopen': (1, 5)
+}
+
+WAYPOINTS_FILE_TEMPLATE = "Waypoints_{call}.txt"
+APRS_CODES_FILE = "APRS_Codes.txt"
+
+
+# Herkent regels zoals:
+# 49.98172°N 6.08968°E
+# Ook regels met een expliciet minteken voor het getal,
+# bv: 50.39012°N -0.02114°E
+COORD_RE = re.compile(
+    r'(-?[\d.]+)\s*°?\s*([NS])\s+(-?[\d.]+)\s*°?\s*([EW])'
+)
+
+
+# Lock zodat de console-output van meerdere objecten niet door elkaar loopt
+PRINT_LOCK = threading.Lock()
+
+
+def safe_print(*args, **kwargs):
+    with PRINT_LOCK:
+        print(*args, **kwargs)
+
+
+def read_aprs_codes(path=APRS_CODES_FILE):
+    """
+    Leest APRS passcodes uit APRS_Codes.txt.
+
+    Verwacht regels zoals:
+        pa3efr 22196
+        pd1eho 23212
+
+    De callsign wordt hoofdletterongevoelig verwerkt.
+    Een eventuele SSID wordt genegeerd.
+
+    Regels die leeg zijn of met '#' beginnen worden genegeerd.
+    """
+    codes = {}
+
+    if not os.path.isfile(path):
+        return codes
+
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+
+            if not line or line.startswith("#"):
+                continue
+
+            parts = line.split()
+
+            if len(parts) < 2:
+                continue
+
+            callsign = parts[0].upper().split("-")[0]
+            code = parts[1].strip()
+
+            codes[callsign] = code
+
+    return codes
+
+
+def get_aprs_passcode(call):
+    """
+    Bepaal de APRS passcode voor een callsign.
+
+    Eerst wordt gezocht in APRS_Codes.txt met de callsign
+    zonder SSID.
+
+    Bijvoorbeeld:
+        PA3EFR
+        PA3EFR-1
+        PA3EFR-9
+
+    zoeken allemaal naar:
+        PA3EFR
+
+    Alleen wanneer de callsign niet in APRS_Codes.txt
+    voorkomt, wordt de gebruiker om een passcode gevraagd.
+    """
+    base_call = call.split("-")[0].upper()
+
+    codes = read_aprs_codes()
+
+    if base_call in codes:
+        print(
+            f"Passcode voor {call} gevonden in "
+            f"{APRS_CODES_FILE}: {codes[base_call]}.\n"
+        )
+        return codes[base_call]
+
+    print(
+        f"Callsign {base_call} staat niet in "
+        f"{APRS_CODES_FILE}."
+    )
+
+    return input(f"Go to https://www.iz3mez.it/aprs-passcode/ for passcode. Passcode voor {call}: ").strip()
+
+
+def read_waypoints(path):
+    """
+    Leest waypoints uit een bestand met blokken van
+    (minstens) 3 regels per punt:
+
+      1: *NN-X "naam" hinzugefügt
+      2: UTM-regel (wordt genegeerd)
+      3: GPS-positie, bv: 49.98172°N 6.08968°E
+
+    Er kunnen willekeurig veel waypoints in het bestand staan.
+    Elke regel die op het coördinatenpatroon matcht wordt als
+    waypoint meegenomen, in de volgorde waarin ze in het
+    bestand voorkomen.
+    """
+    if not os.path.isfile(path):
+        raise FileNotFoundError(
+            f"Waypoints-bestand niet gevonden: {path}"
+        )
+
+    wp = []
+
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            m = COORD_RE.search(line)
+
+            if not m:
+                continue
+
+            # Als het getal al een expliciet minteken heeft,
+            # is dat leidend.
+            lat = float(m.group(1))
+
+            if lat >= 0 and m.group(2) == "S":
+                lat = -lat
+
+            lon = float(m.group(3))
+
+            if lon >= 0 and m.group(4) == "W":
+                lon = -lon
+
+            wp.append((lat, lon))
+
+    if len(wp) < 2:
+        raise ValueError(
+            f"Te weinig waypoints gevonden in {path} "
+            f"({len(wp)})"
+        )
+
+    # In het bestand staat de laatste waypoint bovenaan,
+    # dus omdraaien.
+    wp.reverse()
+
+    return wp
+
+
+def get_object_input(index, total):
+    print("\n" + "=" * 60)
+    print(f"Object {index}/{total}")
+    print("=" * 60)
+
+    call = input("Callsign: ").strip().upper()
+
+    # Eerst automatisch zoeken in APRS_Codes.txt.
+    # Alleen bij een onbekende callsign wordt om invoer
+    # van de passcode gevraagd.
+    code = get_aprs_passcode(call)
+
+    print("1=Auto 2=Fiets 3=Lopen")
+
+    t = {
+        '1': 'auto',
+        '2': 'fiets',
+        '3': 'lopen'
+    }[input("Keuze: ").strip()]
+
+    iv = int(input("Interval (s): "))
+
+    comment = input("Comment: ").strip()
+
+    # Waypoints-bestand wordt afgeleid van de callsign
+    # zonder SSID.
+    #
+    # Bijvoorbeeld:
+    #   PD1EHO-1
+    #   PD1EHO-8
+    #
+    # wordt:
+    #   Waypoints_pd1eho.txt
+    base_call = call.split("-")[0]
+
+    path = WAYPOINTS_FILE_TEMPLATE.format(
+        call=base_call.lower()
+    )
+
+    wp = read_waypoints(path)
+
+    print(f"\n{len(wp)} waypoints geladen uit {path}:")
+
+    for i, (la, lo) in enumerate(wp, 1):
+        print(f"  {i}: {la:.6f},{lo:.6f}")
+
+    return {
+        "call": call,
+        "code": code,
+        "comment": comment,
+        "type": t,
+        "interval": iv,
+        "waypoints": wp,
+    }
+
+
+def get_input():
+    print(
+        "=" * 60 +
+        "\nAPRS Tracker (multi-object)\n" +
+        "=" * 60
+    )
+
+    n = int(input("Hoeveel objecten wil je volgen? "))
+
+    if n < 1:
+        raise ValueError(
+            "Er moet minstens 1 object zijn"
+        )
+
+    objects = [
+        get_object_input(i, n)
+        for i in range(1, n + 1)
+    ]
+
+    return objects
+
+
+def dist(a, b):
+    R = 6371
+
+    dlat = math.radians(b[0] - a[0])
+    dlon = math.radians(b[1] - a[1])
+
+    x = (
+        math.sin(dlat / 2) ** 2
+        + math.cos(math.radians(a[0]))
+        * math.cos(math.radians(b[0]))
+        * math.sin(dlon / 2) ** 2
+    )
+
+    return R * 2 * math.atan2(
+        math.sqrt(x),
+        math.sqrt(1 - x)
+    )
+
+
+def lerp(a, b, n, variation=0.25):
+    """
+    Interpoleert n+1 punten tussen a en b
+    (inclusief begin- en eindpunt).
+
+    In plaats van steeds precies gelijke stapgroottes
+    krijgt elke tussenstap een willekeurig gewicht
+    van (1-variation) tot (1+variation) keer de
+    gemiddelde stapgrootte.
+
+    Na normalisatie vallen het begin- en eindpunt
+    nog steeds exact op a en b.
+    """
+    if n <= 0:
+        return [a, b]
+
+    weights = [
+        random.uniform(1 - variation, 1 + variation)
+        for _ in range(n)
+    ]
+
+    total = sum(weights)
+
+    fracs = [0.0]
+    acc = 0.0
+
+    for w in weights:
+        acc += w
+        fracs.append(acc / total)
+
+    return [
+        (
+            a[0] + (b[0] - a[0]) * f,
+            a[1] + (b[1] - a[1]) * f
+        )
+        for f in fracs
+    ]
+
+
+def aprs_pos(call, lat, lon, sym, comment):
+    """
+    APRS ongecomprimeerde positie zonder timestamp.
+
+    Formaat:
+        !DDMM.mmN/DDDMM.mmE>comment
+    """
+
+    if not (-90.0 <= lat <= 90.0):
+        raise ValueError(
+            f"Ongeldige latitude: {lat}"
+        )
+
+    if not (-180.0 <= lon <= 180.0):
+        raise ValueError(
+            f"Ongeldige longitude: {lon}"
+        )
+
+    # Latitude: DDMM.mmN/S
+    lat_abs = abs(lat)
+    lat_deg = int(lat_abs)
+    lat_min = (lat_abs - lat_deg) * 60.0
+    lat_dir = "N" if lat >= 0 else "S"
+
+    # Longitude: DDDMM.mmE/W
+    lon_abs = abs(lon)
+    lon_deg = int(lon_abs)
+    lon_min = (lon_abs - lon_deg) * 60.0
+    lon_dir = "E" if lon >= 0 else "W"
+
+    lat_text = f"{lat_deg:02d}{lat_min:05.2f}{lat_dir}"
+    lon_text = f"{lon_deg:03d}{lon_min:05.2f}{lon_dir}"
+
+    # '/' = primary symbol table
+    info = f"!{lat_text}/{lon_text}{sym}{comment}"
+
+    packet = f"{call}>APRS,TCPIP*:{info}"
+
+    return packet, info
+
+
+def upload(call, code, pkt, log_prefix):
+    try:
+        ais = aprslib.IS(
+            call,
+            passwd=code,
+            port=14580
+        )
+
+        ais.connect()
+        ais.sendall(pkt)
+
+        safe_print(f"{log_prefix}  ✓ OK")
+
+        return True
+
+    except Exception as e:
+        safe_print(f"{log_prefix}  ✗ {e}")
+        return False
+
+    finally:
+        try:
+            ais.close()
+        except:
+            pass
+
+
+def track_object(obj, results):
+    """
+    Loopt alle segmenten van één object af en stuurt
+    de posities. Draait in een eigen thread.
+    """
+    call = obj["call"]
+    code = obj["code"]
+    comment = obj["comment"]
+    t = obj["type"]
+    iv = obj["interval"]
+    wp = obj["waypoints"]
+
+    # APRS-symboolcodes uit de PRIMAIRE tabel ('/'):
+    #
+    #   '>' = Car (auto)
+    #   'b' = Bike (fiets)
+    #   '[' = Jogger (lopend mannetje)
+    sym = {
+        'auto': '>',
+        'fiets': 'b',
+        'lopen': '['
+    }[t]
+
+    log_prefix = f"[{call}]"
+
+    safe_print(
+        f"{log_prefix} start | "
+        f"{comment} | {t} | {iv}s"
+    )
+
+    ok, tot = 0, 0
+
+    for i in range(len(wp) - 1):
+        a, b = wp[i], wp[i + 1]
+
+        d = dist(a, b)
+
+        s = random.uniform(
+            *SPEED_RANGES[t]
+        )
+
+        dur = d / s * 3600
+
+        n = max(
+            1,
+            int(dur / iv)
+        )
+
+        safe_print(
+            f"{log_prefix} Seg {i + 1}: "
+            f"{d:.2f}km @ {s:.1f}km/h = "
+            f"{dur:.0f}s ({n} pts)"
+        )
+
+        for j, (la, lo) in enumerate(
+            lerp(a, b, n)
+        ):
+            pkt, info = aprs_pos(
+                call,
+                la,
+                lo,
+                sym,
+                comment
+            )
+
+            safe_print(
+                f"{log_prefix}  Input: "
+                f"{la:.6f}, {lo:.6f}"
+            )
+
+            safe_print(
+                f"{log_prefix}  APRS: {info}"
+            )
+
+            if upload(
+                call,
+                code,
+                pkt,
+                log_prefix
+            ):
+                ok += 1
+
+            tot += 1
+
+            if j < n:
+                time.sleep(
+                    iv * random.uniform(
+                        0.8,
+                        1.2
+                    )
+                )
+
+    results[call] = (ok, tot)
+
+    safe_print(
+        f"{log_prefix} klaar: "
+        f"{ok}/{tot} OK | "
+        f"aprs.fi/?call={call}"
+    )
+
+
+def main():
+    objects = get_input()
+
+    print(
+        f"\n{len(objects)} object(en) worden "
+        f"gelijktijdig gevolgd\n" +
+        "=" * 60
+    )
+
+    results = {}
+    threads = []
+
+    for obj in objects:
+        th = threading.Thread(
+            target=track_object,
+            args=(obj, results),
+            daemon=True
+        )
+
+        threads.append(th)
+
+    # Alle threads (bijna) tegelijk starten zodat de
+    # objecten gelijktijdig op aprs.fi te volgen zijn,
+    # ongeacht hun individuele interval.
+    for th in threads:
+        th.start()
+
+    for th in threads:
+        th.join()
+
+    print("\n" + "=" * 60)
+    print("Samenvatting:")
+
+    for obj in objects:
+        call = obj["call"]
+
+        ok, tot = results.get(
+            call,
+            (0, 0)
+        )
+
+        print(
+            f"  {call}: "
+            f"{ok}/{tot} OK | "
+            f"aprs.fi/?call={call}"
+        )
+
+
+if __name__ == "__main__":
+    main()
+
